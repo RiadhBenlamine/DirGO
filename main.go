@@ -9,6 +9,7 @@ import (
 	"net/http"
 	"os"
 	"regexp"
+	"strings"
 	"sync"
 	"time"
 
@@ -193,6 +194,16 @@ func main() {
 	results := make(chan Result)
 	var wg sync.WaitGroup
 	baseURL := config.baseURL
+	if baseURL == "" {
+		log.Fatal("Base URL not specified")
+	}
+	if !strings.HasSuffix(baseURL, "/") {
+		baseURL += "/"
+	}
+	if !strings.HasPrefix(baseURL, "http://") || !strings.HasPrefix(baseURL, "https://") {
+		// Default https
+		baseURL = "https://" + baseURL
+	}
 	client := &http.Client{
 		Timeout: time.Second * time.Duration(config.timeout),
 		Transport: &http.Transport{
