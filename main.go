@@ -9,18 +9,20 @@ import (
 	"net/http"
 	"os"
 	"regexp"
+	"strconv"
 	"strings"
 	"sync"
 	"time"
 
 	"github.com/urfave/cli/v2"
 )
+
 var re = regexp.MustCompile(`(?i)<title>(.*?)</title>`)
 
 type Config struct {
 	pathFile  string
 	baseURL   string
-	matchCode int
+	matchCode string
 	timeout   int
 	threads   int
 	tlsCheck  bool
@@ -85,42 +87,76 @@ func output(path string, results []Result) error {
 	return writer.Flush()
 }
 
-func brute(path string, results chan<- Result, client *http.Client, matchCode int) {
+func brute(path string, results chan<- Result, client *http.Client, matchCodes map[int]bool) {
 	response, err := client.Get(path)
-	title := ""
-	statusCode := 0
 	if err != nil {
+		log.Printf("Request failed for %s: %v", path, err)
 		return
 	}
 	defer func(Body io.ReadCloser) {
 		err := Body.Close()
 		if err != nil {
-			return
+			log.Fatal(err)
 		}
 	}(response.Body)
-	bodyBytes, err := io.ReadAll(response.Body)
-	if err != nil {
+
+	// If wildcard marker 0 is set, accept every status code.
+	if !matchCodes[0] && !matchCodes[response.StatusCode] {
 		return
 	}
-	body := string(bodyBytes)
 
-	match := re.FindStringSubmatch(body)
-	if match != nil {
-		title = match[1]
-	}
-	statusCode = response.StatusCode
-	if statusCode == matchCode {
-		res := Result{
-			path:       path,
-			statusCode: statusCode,
-			title:      title,
-		}
-		results <- res
+	body, err := io.ReadAll(response.Body)
+	if err != nil {
+		log.Printf("Failed to read response body for %s: %v", path, err)
+		return
 	}
 
+	title := ""
+	matches := re.FindSubmatch(body)
+
+	if len(matches) > 1 {
+		title = strings.TrimSpace(string(matches[1]))
+	}
+
+	results <- Result{
+		path:       path,
+		statusCode: response.StatusCode,
+		title:      title,
+	}
 }
 
-func worker(jobs <-chan string, results chan<- Result, wg *sync.WaitGroup, client *http.Client, matchCode int) {
+func handleCodes(codes string) (map[int]bool, error) {
+	result := make(map[int]bool)
+
+
+	if strings.TrimSpace(codes) == "" {
+		result[0] = true
+		return result, nil
+	}
+
+	for code := range strings.SplitSeq(codes, ",") {
+		code = strings.TrimSpace(code)
+
+		if code == "" {
+			return nil, fmt.Errorf("empty status code in input")
+		}
+
+		n, err := strconv.Atoi(code)
+		if err != nil {
+			return nil, fmt.Errorf("invalid status code %q: %w", code, err)
+		}
+
+		if n < 100 || n > 599 {
+			return nil, fmt.Errorf("invalid HTTP status code: %d", n)
+		}
+
+		result[n] = true
+	}
+
+	return result, nil
+}
+
+func worker(jobs <-chan string, results chan<- Result, wg *sync.WaitGroup, client *http.Client, matchCode map[int]bool) {
 	defer wg.Done()
 	for path := range jobs {
 		brute(path, results, client, matchCode)
@@ -145,10 +181,10 @@ func main() {
 				Usage:       "Number of threads",
 				Destination: &config.threads,
 			},
-			&cli.IntFlag{
+			&cli.StringFlag{
 				Name:        "match-code",
 				Aliases:     []string{"m"},
-				Value:       200,
+				Value:       "",
 				Usage:       "Match code",
 				Destination: &config.matchCode,
 			},
@@ -200,7 +236,7 @@ func main() {
 	if !strings.HasSuffix(baseURL, "/") {
 		baseURL += "/"
 	}
-	if !strings.HasPrefix(baseURL, "http://") || !strings.HasPrefix(baseURL, "https://") {
+	if !strings.HasPrefix(baseURL, "http://") && !strings.HasPrefix(baseURL, "https://") {
 		// Default https
 		baseURL = "https://" + baseURL
 	}
@@ -212,10 +248,13 @@ func main() {
 			},
 		},
 	}
-
+	matchCodes, err := handleCodes(config.matchCode)
+	if err != nil {
+		log.Fatal(err)
+	}
 	for range config.threads {
 		wg.Add(1)
-		go worker(jobs, results, &wg, client, config.matchCode)
+		go worker(jobs, results, &wg, client, matchCodes)
 	}
 	go func() {
 		defer close(jobs)
@@ -238,5 +277,4 @@ func main() {
 			log.Fatal(err)
 		}
 	}
-
 }
